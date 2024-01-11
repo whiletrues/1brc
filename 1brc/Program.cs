@@ -1,15 +1,6 @@
-﻿using System.Buffers;
-using System.Collections.Concurrent;
-using System.Collections.Immutable;
-using System.Diagnostics;
-using System.IO.MemoryMappedFiles;
-using System.Numerics;
+﻿using System.IO.MemoryMappedFiles;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using System.Runtime.Intrinsics;
-using System.Runtime.Intrinsics.X86;
-using System.Security.Cryptography;
-using System.Text;
 
 namespace _1brc;
 
@@ -103,7 +94,6 @@ class Program
         private const uint FnvPrime = 16777619;
         private const uint FnvOffsetBasis = 2166136261;
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public unsafe int GetHashCode(ReadOnlySpan<byte> span)
         {
             unchecked
@@ -143,7 +133,7 @@ class Program
             }
         }
 
-        unsafe Dictionary<int, int> Compute((long, long) chunk, byte* pointer)
+        unsafe Dictionary<int, Aggregation> Compute((long, long) chunk, byte* pointer)
         {
             long startPosition = chunk.Item1;
             long chunkSize = chunk.Item2;
@@ -153,7 +143,7 @@ class Program
             int start = 0;
             int end = 0;
 
-            Dictionary<int, int> localMap = new();
+            Dictionary<int, Aggregation> localMap = new();
 
             while (end < chunkSpan.Length)
             {
@@ -177,13 +167,18 @@ class Program
                 }
 
                 var city = line.Slice(0, separator);
-
+                var value = ParseInt(line, separator + 1, line.Length - separator - 1);
 
                 ref var refVal =
                     ref CollectionsMarshal.GetValueRefOrAddDefault(localMap, GetHashCode(city), out bool exit);
+                
                 if (!exit)
                 {
-                    refVal = ParseInt(line, separator + 1, line.Length - separator - 1);
+                    refVal = new Aggregation(value);
+                }
+                else
+                {
+                    refVal.Update(value);
                 }
 
 
@@ -209,28 +204,31 @@ class Program
         }
 
 
-        static Dictionary<int, int> result = new(100000);
+        static Dictionary<int, Aggregation> result = new(450);
 
 
-        unsafe void AggregateResult(Dictionary<int, int> input)
+        unsafe void AggregateResult(Dictionary<int, Aggregation> input)
         {
 
             var kvArray = input.ToArray();
-            var kvSpan = new Span<KeyValuePair<int, int>>(kvArray);
+            var kvSpan = new Span<KeyValuePair<int, Aggregation>>(kvArray);
 
-            fixed (KeyValuePair<int, int>* ptr = kvSpan)
+            fixed (KeyValuePair<int, Aggregation>* ptr = kvSpan)
             {
                 var kvPtr = ptr;
                 var endPtr = kvPtr + kvSpan.Length;
                 while (kvPtr < endPtr)
                 {
-                    if (!result.TryGetValue(kvPtr->Key, out int existingValue))
+                    if (!result.TryGetValue(kvPtr->Key, out Aggregation existing))
                     {
-                        result[kvPtr->Key] = kvPtr->Value;
+                        var aggregation = new Aggregation();
+                        aggregation.Merge(kvPtr->Value);
+                        
+                        result[kvPtr->Key] = aggregation;
                     }
                     else
                     {
-                        result[kvPtr->Key] = existingValue + kvPtr->Value;
+                        result[kvPtr->Key] = kvPtr->Value;
                     }
 
                     kvPtr++;
