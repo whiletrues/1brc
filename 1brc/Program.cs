@@ -1,6 +1,16 @@
-﻿using System.IO.MemoryMappedFiles;
+﻿using System.Globalization;
+using System.IO.MemoryMappedFiles;
+using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
+using System.Text;
+using System.Numerics;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 
 namespace _1brc;
 
@@ -66,74 +76,87 @@ class Program
             return chunkOffsets;
         }
 
-        public unsafe int ParseInt(ReadOnlySpan<byte> source, int start, int length)
-        {
-            int sign = 1;
-            uint value = 0;
-            var end = start + length;
-
-            fixed (byte* sourcePtr = &source[0])
-            {
-                byte* ptr = sourcePtr + start;
-
-                for (; start < end; start++)
-                {
-                    var c = (uint)*(ptr + start);
-
-                    if (c == '-')
-                        sign = -1;
-                    else
-                        value = value * 10u + (c - '0');
-                }
-
-                var fractional = (uint)*(ptr + start + 1) - '0';
-                return sign * (int)(value * 10 + fractional);
-            }
-        }
-
         private const uint FnvPrime = 16777619;
         private const uint FnvOffsetBasis = 2166136261;
 
-        public unsafe int GetHashCode(ReadOnlySpan<byte> span)
+        unsafe struct UnsafeString : IEquatable<UnsafeString>
         {
-            unchecked
+            private readonly byte* pointer;
+            private readonly int length;
+
+            public UnsafeString(byte* pointer, int length)
             {
-                uint hash = FnvOffsetBasis;
+                this.pointer = pointer;
+                this.length = length;
+            }
 
-                fixed (byte* ptr = &span[0])
+            public ReadOnlySpan<byte> AsSpan() => new(pointer, length);
+
+            public override string ToString()
+            {
+                return Encoding.UTF8.GetString(pointer, length);
+            }
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            public bool Equals(UnsafeString other)
+            {
+                if (length != other.length)
                 {
-                    byte* p = ptr;
-                    int remainingBytes = span.Length;
-
-                    while (remainingBytes >= sizeof(uint))
-                    {
-                        hash ^= *((uint*)p);
-                        hash *= FnvPrime;
-
-                        p += sizeof(uint);
-                        remainingBytes -= sizeof(uint);
-                    }
-
-                    if (remainingBytes > 0)
-                    {
-                        uint remainingValue = 0;
-
-                        for (int i = 0; i < remainingBytes; ++i)
-                        {
-                            remainingValue <<= 8;
-                            remainingValue |= *p++;
-                        }
-
-                        hash ^= remainingValue;
-                        hash *= FnvPrime;
-                    }
+                    return false;
                 }
 
-                return (int)hash;
+                return AsSpan().SequenceEqual(other.AsSpan());
+            }
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            public override bool Equals(object obj)
+            {
+                if (obj is UnsafeString other)
+                {
+                    return Equals(other);
+                }
+
+                return false;
+            }
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            public override int GetHashCode()
+            {
+                if (length >= 3)
+                    return (int)((length * 820243u) ^ (uint)(*(uint*)(pointer)));
+
+                return (int)(uint)(*(ushort*)pointer * 31);
+            }
+
+            public static UnsafeString FromReadOnlySpan(ReadOnlySpan<byte> span)
+            {
+                fixed (byte* ptr = &span[0])
+                {
+                    return new UnsafeString(ptr, span.Length);
+                }
             }
         }
 
-        unsafe Dictionary<int, Aggregation> Compute((long, long) chunk, byte* pointer)
+        public nint ParseInt(ReadOnlySpan<byte> source)
+        {
+            nint sign;
+            
+            if (source[0] == (byte)'-')
+            {
+                sign = -1;
+            }
+            else
+            {
+                sign = 1;
+            }
+            if (source[1] == '.')
+                return (nint)(source[0] * 10u + source[2] - ('0' * 11u)) * sign;
+            
+            return (nint)(source[0] * 100u + source[1] * 10 + source[3] - '0' * 111u) * sign;
+        }
+
+
+        unsafe Dictionary<UnsafeString, Aggregation> Compute((long, long) chunk, byte* pointer)
         {
             long startPosition = chunk.Item1;
             long chunkSize = chunk.Item2;
@@ -143,7 +166,7 @@ class Program
             int start = 0;
             int end = 0;
 
-            Dictionary<int, Aggregation> localMap = new();
+            Dictionary<UnsafeString, Aggregation> localMap = new(413);
 
             while (end < chunkSpan.Length)
             {
@@ -165,13 +188,12 @@ class Program
                         break;
                     }
                 }
-
-                var city = line.Slice(0, separator);
-                var value = ParseInt(line, separator + 1, line.Length - separator - 1);
-
-                ref var refVal =
-                    ref CollectionsMarshal.GetValueRefOrAddDefault(localMap, GetHashCode(city), out bool exit);
                 
+                var unsafeString = UnsafeString.FromReadOnlySpan(line.Slice(0, separator));
+                
+                var value = ParseInt(line.Slice(separator + 1, line.Length - separator - 1));
+                ref var refVal = ref CollectionsMarshal.GetValueRefOrAddDefault(localMap, unsafeString, out bool exit);
+
                 if (!exit)
                 {
                     refVal = new Aggregation(value);
@@ -180,13 +202,9 @@ class Program
                 {
                     refVal.Update(value);
                 }
-
-
-                // Convert the input string to a byte array and compute the hash.
-                // Move to the next line
+                
                 if (end < chunkSpan.Length && (chunkSpan[end] == '\n' || chunkSpan[end] == '\r'))
                 {
-                    // Move past the newline character(s)
                     if (end + 1 < chunkSpan.Length && (chunkSpan[end] == '\n' && chunkSpan[end + 1] == '\r'))
                     {
                         end += 2;
@@ -203,17 +221,14 @@ class Program
             return localMap;
         }
 
+        static Dictionary<UnsafeString, Aggregation> result = new(10000);
 
-        static Dictionary<int, Aggregation> result = new(450);
-
-
-        unsafe void AggregateResult(Dictionary<int, Aggregation> input)
+        unsafe void AggregateResult(Dictionary<UnsafeString, Aggregation> input)
         {
-
             var kvArray = input.ToArray();
-            var kvSpan = new Span<KeyValuePair<int, Aggregation>>(kvArray);
+            var kvSpan = new Span<KeyValuePair<UnsafeString, Aggregation>>(kvArray);
 
-            fixed (KeyValuePair<int, Aggregation>* ptr = kvSpan)
+            fixed (KeyValuePair<UnsafeString, Aggregation>* ptr = kvSpan)
             {
                 var kvPtr = ptr;
                 var endPtr = kvPtr + kvSpan.Length;
@@ -221,14 +236,11 @@ class Program
                 {
                     if (!result.TryGetValue(kvPtr->Key, out Aggregation existing))
                     {
-                        var aggregation = new Aggregation();
-                        aggregation.Merge(kvPtr->Value);
-                        
-                        result[kvPtr->Key] = aggregation;
+                        result[kvPtr->Key] = kvPtr->Value;
                     }
                     else
                     {
-                        result[kvPtr->Key] = kvPtr->Value;
+                        result[kvPtr->Key].Merge(kvPtr->Value);
                     }
 
                     kvPtr++;

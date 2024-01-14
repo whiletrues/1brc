@@ -6,12 +6,12 @@ namespace _1brc;
 public  struct Aggregation
 {
     public long Sum;
-    public int Count;
+    public nint Count;
     public short Min;
     public short Max;
     public double Average => (double)Sum / Count;
 
-    public Aggregation(int value)
+    public Aggregation(nint value)
     {
         Sum += value;
         Count++;
@@ -21,7 +21,7 @@ public  struct Aggregation
 
     public override string ToString() => $"{Min / 10.0:N1}/{Average / 10.0:N1}/{Max / 10.0:N1}";
 
-    public void Update(int value)
+    public void Update(nint value)
     {
         Sum += value;
 
