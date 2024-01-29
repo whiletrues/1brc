@@ -89,8 +89,9 @@ class Program
                 this.pointer = pointer;
                 this.length = length;
             }
+        
 
-            public ReadOnlySpan<byte> AsSpan() => new(pointer, length);
+        public ReadOnlySpan<byte> AsSpan() => new(pointer, length);
 
             public override string ToString()
             {
@@ -100,12 +101,18 @@ class Program
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
             public bool Equals(UnsafeString other)
             {
-                if (length != other.length)
+                if (Sse2.IsSupported && length == 16 && other.length == 16)
                 {
-                    return false;
+                    Vector128<byte> leftVector = Unsafe.ReadUnaligned<Vector128<byte>>(ref MemoryMarshal.GetReference(AsSpan()));
+                    Vector128<byte> rightVector = Unsafe.ReadUnaligned<Vector128<byte>>(ref MemoryMarshal.GetReference(other.AsSpan()));
+
+                    var equals = Sse2.CompareEqual(leftVector, rightVector);
+                    var result = Sse2.MoveMask(equals);
+                    return (result & 0xFFFF) == 0xFFFF;
                 }
 
-                return AsSpan().SequenceEqual(other.AsSpan());
+                return other.AsSpan().SequenceEqual(AsSpan());
+
             }
 
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -122,6 +129,7 @@ class Program
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
             public override int GetHashCode()
             {
+                
                 if (length >= 3)
                     return (int)((length * 820243u) ^ (uint)(*(uint*)(pointer)));
 
@@ -140,7 +148,7 @@ class Program
         public nint ParseInt(ReadOnlySpan<byte> source)
         {
             nint sign;
-            
+
             if (source[0] == (byte)'-')
             {
                 sign = -1;
@@ -149,9 +157,10 @@ class Program
             {
                 sign = 1;
             }
+
             if (source[1] == '.')
                 return (nint)(source[0] * 10u + source[2] - ('0' * 11u)) * sign;
-            
+
             return (nint)(source[0] * 100u + source[1] * 10 + source[3] - '0' * 111u) * sign;
         }
 
@@ -166,7 +175,7 @@ class Program
             int start = 0;
             int end = 0;
 
-            Dictionary<UnsafeString, Aggregation> localMap = new(413);
+            Dictionary<UnsafeString, Aggregation> localMap = new();
 
             while (end < chunkSpan.Length)
             {
@@ -188,9 +197,9 @@ class Program
                         break;
                     }
                 }
-                
+
                 var unsafeString = UnsafeString.FromReadOnlySpan(line.Slice(0, separator));
-                
+
                 var value = ParseInt(line.Slice(separator + 1, line.Length - separator - 1));
                 ref var refVal = ref CollectionsMarshal.GetValueRefOrAddDefault(localMap, unsafeString, out bool exit);
 
@@ -202,7 +211,7 @@ class Program
                 {
                     refVal.Update(value);
                 }
-                
+
                 if (end < chunkSpan.Length && (chunkSpan[end] == '\n' || chunkSpan[end] == '\r'))
                 {
                     if (end + 1 < chunkSpan.Length && (chunkSpan[end] == '\n' && chunkSpan[end + 1] == '\r'))
@@ -221,32 +230,36 @@ class Program
             return localMap;
         }
 
-        static Dictionary<UnsafeString, Aggregation> result = new(10000);
-
+        static object locker = new object();
+        
         unsafe void AggregateResult(Dictionary<UnsafeString, Aggregation> input)
         {
             var kvArray = input.ToArray();
             var kvSpan = new Span<KeyValuePair<UnsafeString, Aggregation>>(kvArray);
 
-            fixed (KeyValuePair<UnsafeString, Aggregation>* ptr = kvSpan)
+            lock (locker)
             {
-                var kvPtr = ptr;
-                var endPtr = kvPtr + kvSpan.Length;
-                while (kvPtr < endPtr)
+                fixed (KeyValuePair<UnsafeString, Aggregation>* ptr = kvSpan)
                 {
-                    if (!result.TryGetValue(kvPtr->Key, out Aggregation existing))
+                    var kvPtr = ptr;
+                    var endPtr = kvPtr + kvSpan.Length;
+                    while (kvPtr < endPtr)
                     {
-                        result[kvPtr->Key] = kvPtr->Value;
-                    }
-                    else
-                    {
-                        result[kvPtr->Key].Merge(kvPtr->Value);
-                    }
+                        if (!final.TryGetValue(kvPtr->Key, out Aggregation existing))
+                        {
+                            final[kvPtr->Key] = kvPtr->Value;
+                        }
+                        else
+                        {
+                            final[kvPtr->Key].Merge(kvPtr->Value);
+                        }
 
-                    kvPtr++;
-                }
+                        kvPtr++;
+                    }
+                }   
             }
         }
+        static Dictionary<UnsafeString, Aggregation> final = new(413);
 
         public unsafe void Run()
         {
@@ -268,7 +281,16 @@ class Program
                 .GetAwaiter()
                 .GetResult();
 
-
+            //var stringBuilder = final.Aggregate(new StringBuilder(), (builder, kv) => builder.Append($"{kv.Key}={kv.Value},\n"));
+            var stringBuilder = new StringBuilder();
+            
+            
+            Console.OutputEncoding = Encoding.UTF8;
+            foreach (var kv in final)
+            {
+                stringBuilder.Append($"{kv.Key}={kv.Value},\n");
+            }
+            Console.Write(stringBuilder);
             _viewStream.SafeMemoryMappedViewHandle.ReleasePointer();
         }
     }
